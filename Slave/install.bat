@@ -1,0 +1,1 @@
+pyinstaller --onefile --add-data "MT5_Prop;MT5_Prop" --add-data "MT5_Broker;MT5_Broker" --uac-admin  copier.py
