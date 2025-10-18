@@ -8,6 +8,9 @@ import os
 import time
 import random
 import threading
+import socket
+import ctypes
+from ctypes import wintypes
 from datetime import datetime, timezone
 from setup import main_setup
 
@@ -34,6 +37,51 @@ except ImportError as e:
     print("Vedi le istruzioni nel README")
     sys.exit(1)
 
+# ======= CONFIG RETE =======
+NET_CHECK_HOST = "tevsvjwhgsfzppzrjdwp.supabase.co"
+NET_CHECK_PORT = 443
+NET_CHECK_INTERVAL = 2.0     # controlla rete ogni 2s
+WARN_COOLDOWN = 5.0          # non spammare il warning più spesso di così
+AUTOTRADING_CHECK_INTERVAL = 10.0  # controlla autotrading ogni 10s
+# ===========================
+
+# ======= WINDOWS API PER ALGO TRADING =======
+WM_COMMAND = 0x0111
+GA_ROOT = 2
+MT5_WMCMD_EXPERTS = 32851  # Comando per toggle Algo Trading in MT5
+
+# Definizione funzioni user32.dll
+user32 = ctypes.windll.user32
+
+# FindWindowW per trovare finestra MT5 per titolo
+FindWindowW = user32.FindWindowW
+FindWindowW.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+FindWindowW.restype = wintypes.HWND
+
+# EnumWindows per enumerare tutte le finestre
+EnumWindows = user32.EnumWindows
+EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM), wintypes.LPARAM]
+EnumWindows.restype = wintypes.BOOL
+
+# GetWindowTextW per ottenere titolo finestra
+GetWindowTextW = user32.GetWindowTextW
+GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+GetWindowTextW.restype = ctypes.c_int
+
+# GetWindowTextLengthW per lunghezza titolo
+GetWindowTextLengthW = user32.GetWindowTextLengthW
+GetWindowTextLengthW.argtypes = [wintypes.HWND]
+GetWindowTextLengthW.restype = ctypes.c_int
+
+GetAncestor = user32.GetAncestor
+GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
+GetAncestor.restype = wintypes.HWND
+
+PostMessageW = user32.PostMessageW
+PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+PostMessageW.restype = wintypes.BOOL
+# ============================================
+
 # Variabili globali
 user_id = None
 current_creds = None
@@ -41,6 +89,139 @@ prop_positions = {}  # {ticket: position_data}
 broker_positions = {}  # {ticket: position_data}
 is_running = True
 phase3_starting_balance = None  # Balance iniziale per fase 3
+autotrading_ok = True  # Flag per stato autotrading
+
+
+# -------- Gestione rete --------
+def has_internet(timeout: float = 1.0) -> bool:
+    """Controlla se c'è connessione internet"""
+    try:
+        with socket.create_connection((NET_CHECK_HOST, NET_CHECK_PORT), timeout=timeout):
+            return True
+    except Exception:
+        return False
+
+
+class NetWatcher(threading.Thread):
+    """Thread che monitora lo stato della connessione internet"""
+    def __init__(self, interval: float = NET_CHECK_INTERVAL):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self._stop = threading.Event()
+        self.online = has_internet()
+        self._last_warn = 0.0
+
+    def run(self):
+        while not self._stop.is_set():
+            self.online = has_internet()
+            if not self.online:
+                self.warn_offline()
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._stop.set()
+
+    def warn_offline(self):
+        now = time.time()
+        if now - self._last_warn >= WARN_COOLDOWN:
+            print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Internet mancante: impossibile comunicare con il database (verrà ritentato automaticamente)")
+            self._last_warn = now
+
+
+class AutoTradingWatcher(threading.Thread):
+    """Thread che controlla lo stato dell'autotrading ogni 10 secondi e tenta di riabilitarlo automaticamente"""
+    def __init__(self, vps_ip: str, interval: float = AUTOTRADING_CHECK_INTERVAL):
+        super().__init__(daemon=True)
+        self.interval = interval
+        self.vps_ip = vps_ip
+        self._stop = threading.Event()
+
+    def run(self):
+        global autotrading_ok
+        while not self._stop.is_set():
+            try:
+                # Controlla PROP
+                prop_terminal_info = mt5_prop.terminal_info()
+                prop_ok = prop_terminal_info and hasattr(prop_terminal_info, 'trade_allowed') and prop_terminal_info.trade_allowed
+
+                # Controlla BROKER
+                broker_terminal_info = mt5_broker.terminal_info()
+                broker_ok = broker_terminal_info and hasattr(broker_terminal_info, 'trade_allowed') and broker_terminal_info.trade_allowed
+
+                # Se uno dei due è disabilitato
+                if not prop_ok or not broker_ok:
+                    if autotrading_ok:  # Solo se era ok prima
+                        autotrading_ok = False
+                        accounts_disabled = []
+                        accounts_to_enable = []
+
+                        if not prop_ok:
+                            accounts_disabled.append("PROP")
+                            accounts_to_enable.append(("PROP", mt5_prop))
+                        if not broker_ok:
+                            accounts_disabled.append("BROKER")
+                            accounts_to_enable.append(("BROKER", mt5_broker))
+
+                        print(f"\n{'=' * 60}")
+                        print(f"⚠ ATTENZIONE: AutoTrading DISABILITATO su {', '.join(accounts_disabled)}")
+                        print(f"{'=' * 60}")
+
+                        # Tenta di riabilitare automaticamente
+                        print("→ Tentativo di riabilitazione automatica tramite API Windows...")
+
+                        all_enabled = True
+                        failed_accounts = []
+
+                        for account_name, mt5_instance in accounts_to_enable:
+                            # Ottieni account_id dalla istanza
+                            account_info = mt5_instance.account_info()
+                            if account_info:
+                                account_id = account_info.login
+                                success = enable_algo_trading_via_api(mt5_instance, account_name, account_id, max_attempts=2)
+                                if not success:
+                                    all_enabled = False
+                                    failed_accounts.append(account_name)
+                            else:
+                                all_enabled = False
+                                failed_accounts.append(account_name)
+
+                        # Se tutti gli account sono stati abilitati con successo
+                        if all_enabled:
+                            autotrading_ok = True
+                            print(f"\n✓ AutoTrading riabilitato automaticamente su tutti gli account!")
+                            print(f"{'=' * 60}\n")
+                        else:
+                            # Se qualche account non è stato abilitato, invia email all'admin
+                            print(f"\n✗ Impossibile abilitare AutoTrading automaticamente su: {', '.join(failed_accounts)}")
+                            print("→ Invio email all'admin...")
+
+                            subject = "URGENTE: AutoTrading disabilitato su MT5 - Intervento richiesto"
+                            message = (
+                                f"L'AutoTrading è stato disabilitato su IP VPS: {self.vps_ip}\n\n"
+                                f"Account interessati: {', '.join(failed_accounts)}\n\n"
+                                f"Il sistema ha tentato di riabilitarlo automaticamente ma ha fallito.\n"
+                                f"Per favore, riabilita MANUALMENTE l'AutoTrading su MT5.\n\n"
+                                f"Il trading è completamente bloccato fino al ripristino."
+                            )
+                            config.send_email_to_admin(None, subject, message)
+                            print("✓ Email inviata all'admin")
+                            print(f"{'=' * 60}\n")
+                else:
+                    if not autotrading_ok:  # Era disabilitato ma ora è ok
+                        autotrading_ok = True
+                        print(f"\n{'=' * 60}")
+                        print("✓ AutoTrading RIABILITATO su tutti gli account")
+                        print(f"{'=' * 60}\n")
+
+            except Exception as e:
+                print(f"⚠ Errore controllo autotrading: {e}")
+                import traceback
+                traceback.print_exc()
+
+            time.sleep(self.interval)
+
+    def stop(self):
+        self._stop.set()
 
 
 def get_trade_params(fase, size):
@@ -60,14 +241,14 @@ def get_trade_params(fase, size):
     
     params = {
         1: {
-            'sl_pips': 1250,
+            'sl_pips': 1150,
             'tp_pips': 1250,
             'prop_lots': 2.0,
             'broker_lots': 0.14,
             'broker_enabled': True
         },
         2: {
-            'sl_pips': 1250,
+            'sl_pips': 1150,
             'tp_pips': 625,
             'prop_lots': 2.0,
             'broker_lots': 0.3,
@@ -82,7 +263,7 @@ def get_trade_params(fase, size):
             'target_profit': 50.0
         },
         4: {
-            'sl_pips': 1250,
+            'sl_pips': 1150,
             'tp_pips': 625,
             'prop_lots': 2.0,
             'broker_lots': 0.4,
@@ -93,62 +274,211 @@ def get_trade_params(fase, size):
     return params.get(fase, params[1])
 
 
-def check_and_enable_autotrading(mt5_instance, mt5_path, account_name):
+def find_mt5_window_by_account(account_id, debug=True):
     """
-    Controlla se AlgoTrading è abilitato e lo abilita se necessario.
+    Trova la finestra MT5 tramite il numero di account nel titolo
 
-    IMPORTANTE: MT5 richiede che AutoTrading sia abilitato per aprire ordini via API.
+    Args:
+        account_id: ID account MT5 (es. 12345678)
+        debug: Se True, stampa tutte le finestre trovate (default True)
+
+    Returns:
+        Handle della finestra MT5 o None se non trovata
+    """
+    found_hwnd = None
+    account_str = str(account_id)
+    candidates = []  # Per debug
+
+    def enum_callback(hwnd, lparam):
+        nonlocal found_hwnd
+        # Ottieni lunghezza titolo
+        length = GetWindowTextLengthW(hwnd)
+        if length == 0:
+            return True  # Continua enumerazione
+
+        # Ottieni titolo finestra
+        buffer = ctypes.create_unicode_buffer(length + 1)
+        GetWindowTextW(hwnd, buffer, length + 1)
+        title = buffer.value
+
+        # Cerca finestre che contengono l'account ID
+        if account_str in title:
+            candidates.append((hwnd, title))
+
+            # Formati MT5 possibili:
+            # 1. "12345678 - MetaQuotes-Demo: Conto Demo..." (formato standard)
+            # 2. "MetaTrader 5 - 12345678@Broker-Demo" (formato alternativo)
+            # 3. "12345678@Broker-Demo" (formato corto)
+
+            # Priorità 1: Inizia con account ID seguito da " - " (formato più comune)
+            if title.startswith(account_str + " - "):
+                if not found_hwnd:
+                    found_hwnd = hwnd
+
+            # Priorità 2: Contiene @ (formato con broker)
+            elif "@" in title and account_str in title:
+                if not found_hwnd:
+                    found_hwnd = hwnd
+
+            # Priorità 3: Contiene "MetaTrader" o "MetaQuotes"
+            elif ("MetaTrader" in title or "MetaQuotes" in title) and account_str in title:
+                if not found_hwnd:
+                    found_hwnd = hwnd
+
+        return True  # Continua enumerazione
+
+    # Enumera tutte le finestre
+    EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    EnumWindows(EnumWindowsProc(enum_callback), 0)
+
+    # Debug: stampa tutte le finestre candidate
+    if debug and candidates:
+        print(f"  [DEBUG] Finestre trovate per account {account_id}:")
+        for hwnd, title in candidates:
+            selected = " <-- SELEZIONATA" if hwnd == found_hwnd else ""
+            print(f"    HWND={hwnd}: '{title}'{selected}")
+    elif debug and not candidates:
+        print(f"  [DEBUG] Nessuna finestra trovata con account ID {account_id}")
+
+    return found_hwnd
+
+
+def get_mt5_main_window_handle(mt5_instance, account_id):
+    """
+    Ottiene l'handle della finestra principale di MT5
+
+    Args:
+        mt5_instance: Istanza MT5 (mt5_prop o mt5_broker)
+        account_id: ID account per trovare la finestra giusta
+
+    Returns:
+        Handle della finestra principale MT5 o None se errore
     """
     try:
-        # Controlla se autotrading è già abilitato tramite terminal_info
+        # Metodo 1: Cerca finestra tramite account ID nel titolo
+        hwnd = find_mt5_window_by_account(account_id)
+        if hwnd:
+            return hwnd
+
+        # Metodo 2: Prova con chart_get_integer se disponibile
+        try:
+            if hasattr(mt5_instance, 'chart_get_integer') and hasattr(mt5_instance, 'CHART_WINDOW_HANDLE'):
+                chart_handle = mt5_instance.chart_get_integer(0, mt5_instance.CHART_WINDOW_HANDLE)
+                if chart_handle != 0:
+                    main_window = GetAncestor(chart_handle, GA_ROOT)
+                    if main_window != 0:
+                        return main_window
+        except:
+            pass
+
+        return None
+
+    except Exception as e:
+        print(f"  ⚠ Errore ottenimento handle finestra: {e}")
+        return None
+
+
+def enable_algo_trading_via_api(mt5_instance, account_name, account_id, max_attempts=2):
+    """
+    Abilita Algo Trading usando Windows API (PostMessage)
+
+    Args:
+        mt5_instance: Istanza MT5 (mt5_prop o mt5_broker)
+        account_name: Nome account (per logging)
+        account_id: ID account per trovare la finestra
+        max_attempts: Numero massimo di tentativi
+
+    Returns:
+        bool: True se abilitato con successo, False altrimenti
+    """
+    try:
+        # Verifica stato attuale
+        terminal_info = mt5_instance.terminal_info()
+        if not terminal_info:
+            print(f"  ✗ Impossibile ottenere terminal_info per {account_name}")
+            return False
+
+        current_state = terminal_info.trade_allowed
+
+        if current_state:
+            print(f"  ✓ AlgoTrading già abilitato su {account_name}")
+            return True
+
+        print(f"  → AlgoTrading disabilitato su {account_name}, tento di abilitarlo...")
+
+        # Ottieni handle finestra principale
+        main_window = get_mt5_main_window_handle(mt5_instance, account_id)
+
+        if not main_window:
+            print(f"  ✗ Impossibile ottenere handle finestra per {account_name} (Account ID: {account_id})")
+            return False
+
+        # Tenta di abilitare con retry
+        for attempt in range(1, max_attempts + 1):
+            print(f"  → Tentativo {attempt}/{max_attempts} di abilitazione...")
+
+            # Invia comando toggle Algo Trading
+            result = PostMessageW(main_window, WM_COMMAND, MT5_WMCMD_EXPERTS, 0)
+
+            if not result:
+                print(f"  ⚠ PostMessageW ha restituito False (tentativo {attempt})")
+
+            # Attendi elaborazione comando
+            time.sleep(1.5)
+
+            # Verifica nuovo stato
+            terminal_info = mt5_instance.terminal_info()
+            if terminal_info and terminal_info.trade_allowed:
+                print(f"  ✓ AlgoTrading abilitato con successo su {account_name}!")
+                return True
+
+            print(f"  ✗ Tentativo {attempt} fallito, stato rimane disabilitato")
+
+            # Attendi prima del prossimo tentativo
+            if attempt < max_attempts:
+                time.sleep(1)
+
+        print(f"  ✗ Impossibile abilitare AlgoTrading su {account_name} dopo {max_attempts} tentativi")
+        return False
+
+    except Exception as e:
+        print(f"  ✗ Errore abilitazione AlgoTrading {account_name}: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def check_and_enable_autotrading(mt5_instance, mt5_path, account_name, account_id):
+    """
+    Controlla se AlgoTrading è abilitato e lo abilita se necessario tramite Windows API.
+
+    Args:
+        mt5_instance: Istanza MT5
+        mt5_path: Path al terminal64.exe (non usato, mantenuto per compatibilità)
+        account_name: Nome account (PROP/BROKER)
+        account_id: ID account per trovare la finestra
+
+    Returns:
+        True: già abilitato
+        False: abilitato con successo via API
+        None: impossibile abilitare (richiede intervento manuale)
+    """
+    try:
+        # Controlla se autotrading è già abilitato
         terminal_info = mt5_instance.terminal_info()
 
         if terminal_info and hasattr(terminal_info, 'trade_allowed'):
             if terminal_info.trade_allowed:
                 print(f"  ✓ AlgoTrading già abilitato su {account_name}")
                 return True
-            else:
-                print(f"  ⚠ AlgoTrading NON abilitato su {account_name}, tento di abilitarlo...")
 
-        # Modifica common.ini per abilitare AutoTrading
-        mt5_dir = os.path.dirname(mt5_path)
-        config_dir = os.path.join(mt5_dir, 'config')
-        config_file = os.path.join(config_dir, 'common.ini')
+        # Tenta di abilitare tramite Windows API
+        success = enable_algo_trading_via_api(mt5_instance, account_name, account_id, max_attempts=2)
 
-        if not os.path.exists(config_file):
-            print(f"  ⚠ File {config_file} non trovato, lo creo...")
-            os.makedirs(config_dir, exist_ok=True)
-            with open(config_file, 'w', encoding='utf-8') as f:
-                f.write('AutoTrading=true\n')
-            print(f"  ✓ AutoTrading abilitato in {account_name}")
-            print(f"  ℹ IMPORTANTE: Chiudi e riavvia copier.py per applicare le modifiche")
-            return False
-
-        # Leggi il file esistente
-        try:
-            with open(config_file, 'r', encoding='utf-8') as f:
-                config_content = f.readlines()
-        except:
-            try:
-                with open(config_file, 'r', encoding='utf-16') as f:
-                    config_content = f.readlines()
-            except:
-                config_content = []
-
-        # Rimuovi AutoTrading se esiste
-        config_content = [line for line in config_content if not line.strip().startswith('AutoTrading')]
-
-        # Aggiungi AutoTrading=true come PRIMA riga
-        config_content.insert(0, 'AutoTrading=true\n')
-
-        # Scrivi il file
-        with open(config_file, 'w', encoding='utf-8') as f:
-            f.writelines(config_content)
-
-        print(f"  ✓ AutoTrading abilitato in {config_file}")
-        print(f"  ℹ IMPORTANTE: Chiudi e riavvia copier.py per applicare le modifiche")
-
-        return False  # Richiede riavvio
+        if success:
+            return False  # Abilitato ora (non era abilitato prima)
+        else:
+            return None  # Impossibile abilitare
 
     except Exception as e:
         print(f"  ✗ Errore controllo AlgoTrading {account_name}: {e}")
@@ -158,6 +488,13 @@ def check_and_enable_autotrading(mt5_instance, mt5_path, account_name):
 def login_accounts(creds):
     """
     Effettua il login su prop e broker
+
+    Returns:
+        True se successo
+        False se credenziali errate (non solleva eccezione, solo ritorna False)
+
+    Raises:
+        Exception per altri errori tecnici
     """
     print("\n" + "=" * 60)
     print("LOGIN CONTI MT5")
@@ -192,6 +529,17 @@ def login_accounts(creds):
 
     if not prop_ok:
         error = mt5_prop.last_error()
+        # Errori comuni per credenziali errate:
+        # -6 = Authorization failed
+        # 2 = Common error
+        # 10004 = Invalid account
+        # 10013 = Invalid account credentials
+        error_code = error[0] if error else None
+        error_str = str(error).lower() if error else ""
+
+        if error_code in [-6, 2, 10004, 10013] or 'authorization' in error_str or 'invalid account' in error_str:
+            print(f"✗ CREDENZIALI PROP ERRATE: {error}")
+            return False
         raise Exception(f"Impossibile effettuare login su PROP: {error}")
 
     # Verifica connessione PROP
@@ -226,6 +574,18 @@ def login_accounts(creds):
 
     if not broker_ok:
         error = mt5_broker.last_error()
+        # Errori comuni per credenziali errate:
+        # -6 = Authorization failed
+        # 2 = Common error
+        # 10004 = Invalid account
+        # 10013 = Invalid account credentials
+        error_code = error[0] if error else None
+        error_str = str(error).lower() if error else ""
+
+        if error_code in [-6, 2, 10004, 10013] or 'authorization' in error_str or 'invalid account' in error_str:
+            print(f"✗ CREDENZIALI BROKER ERRATE: {error}")
+            mt5_prop.shutdown()
+            return False
         mt5_prop.shutdown()
         raise Exception(f"Impossibile effettuare login su BROKER: {error}")
 
@@ -242,19 +602,81 @@ def login_accounts(creds):
 
     print(f"✓ Login BROKER completato - Account: {account_info_broker.login}, Balance: {account_info_broker.balance}")
 
-    # Controllo AlgoTrading
+    # Controllo AlgoTrading con tentativo automatico di abilitazione
     print("\n→ Controllo AlgoTrading...")
-    prop_at = check_and_enable_autotrading(mt5_prop, r'C:\Program Files\MT5_prop\terminal64.exe', "PROP")
-    broker_at = check_and_enable_autotrading(mt5_broker, r'C:\Program Files\MT5_broker\terminal64.exe', "BROKER")
+    prop_at = check_and_enable_autotrading(
+        mt5_prop,
+        r'C:\Program Files\MT5_prop\terminal64.exe',
+        "PROP",
+        int(creds['prop']['account_id'])
+    )
+    broker_at = check_and_enable_autotrading(
+        mt5_broker,
+        r'C:\Program Files\MT5_broker\terminal64.exe',
+        "BROKER",
+        int(creds['broker']['account_id'])
+    )
 
-    # Se uno dei due ha richiesto un riavvio, avverti l'utente
-    if prop_at == False or broker_at == False:
+    # Se uno dei due non è riuscito ad abilitarsi (None = fallito), invia email e aspetta
+    if prop_at is None or broker_at is None:
         print("\n" + "=" * 60)
-        print("⚠ ATTENZIONE: AutoTrading è stato abilitato ma")
-        print("   DEVI RIAVVIARE copier.py per applicare le modifiche!")
+        print("⚠ ATTENZIONE: Impossibile abilitare AutoTrading automaticamente")
+        print("   Invio email all'admin...")
         print("=" * 60)
-        input("\nPremi INVIO per uscire e poi riavvia copier.py...")
-        sys.exit(0)
+
+        # Prepara lista account problematici
+        accounts_list = []
+        if prop_at is None:
+            accounts_list.append(f"PROP ({creds['prop']['account_id']})")
+        if broker_at is None:
+            accounts_list.append(f"BROKER ({creds['broker']['account_id']})")
+
+        # Invia email all'admin
+        subject = "URGENTE: AutoTrading non abilitato su MT5 - Intervento richiesto"
+        message = (
+            f"L'AutoTrading non è abilitato sui seguenti account:\n"
+            f"{', '.join(accounts_list)}\n\n"
+            f"Il sistema ha tentato di abilitarlo automaticamente ma ha fallito dopo 2 tentativi.\n"
+            f"Per favore, abilita MANUALMENTE l'AutoTrading su MT5 per questi account.\n\n"
+            f"Il sistema resterà in attesa finché l'AutoTrading non sarà abilitato."
+        )
+        config.send_email_to_admin(None, subject, message)
+
+        print("\n✓ Email inviata all'admin")
+        print("\n→ In attesa che l'admin abiliti l'AutoTrading...")
+        print("   (Controllo ogni 30 secondi...)\n")
+
+        # Loop di attesa finché l'autotrading non è abilitato
+        while True:
+            time.sleep(30)
+
+            # Ricontrolla lo stato e riprova ad abilitare
+            prop_check = check_and_enable_autotrading(
+                mt5_prop,
+                r'C:\Program Files\MT5_prop\terminal64.exe',
+                "PROP",
+                int(creds['prop']['account_id'])
+            )
+            broker_check = check_and_enable_autotrading(
+                mt5_broker,
+                r'C:\Program Files\MT5_broker\terminal64.exe',
+                "BROKER",
+                int(creds['broker']['account_id'])
+            )
+
+            # Se entrambi sono OK (True = già abilitato, False = appena abilitato), esci dal loop
+            if prop_check is not None and broker_check is not None:
+                print("\n✓ AutoTrading abilitato su entrambi gli account!")
+                break
+            else:
+                accounts_waiting = []
+                if prop_check is None:
+                    accounts_waiting.append("PROP")
+                if broker_check is None:
+                    accounts_waiting.append("BROKER")
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Ancora in attesa per: {', '.join(accounts_waiting)}")
+
+        print("=" * 60)
 
     print("\n" + "=" * 60)
 
@@ -274,7 +696,7 @@ def calculate_delay(account_prop_id):
     # Usa l'ID come seed per consistenza
     random.seed(account_prop_id)
     # Ridotto da 0-60s a 0-5s per apertura più rapida
-    delay = random.uniform(0, 5)
+    delay = random.uniform(0, 10)
     random.seed()  # Reset seed
 
     return delay
@@ -682,13 +1104,13 @@ def check_phase3_profit():
         account_info = mt5_prop.account_info()
         if not account_info:
             print("⚠ Impossibile ottenere account_info per fase 3")
-            return
+            return False
 
         # Se non abbiamo ancora salvato il balance iniziale, salvalo ora
         if phase3_starting_balance is None:
             phase3_starting_balance = account_info.balance
             print(f"\n📊 Fase 3: Balance iniziale salvato: ${phase3_starting_balance:.2f}")
-            return
+            return False
 
         # Calcola profitto totale
         current_balance = account_info.balance
@@ -720,9 +1142,171 @@ def check_phase3_profit():
             phase3_starting_balance = None
 
             print(f"=" * 60)
+            return True  # Segnala che la fase è finita
+
+        return False
 
     except Exception as e:
         print(f"✗ Errore check fase 3: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
+def monitor_phase_conditions(fase):
+    """
+    Monitora le condizioni di fine fase e notifica l'utente.
+    Ogni fase inizia con 100k di balance.
+
+    FASE 1: Finisce quando PROP >= 110k (passata) o <= 90k (bruciata)
+    FASE 2: Finisce quando PROP >= 105k (passata) o <= 90k (bruciata)
+    FASE 3: Finisce quando PROP >= 100050 (passata) [gestita da check_phase3_profit]
+    FASE 4: Finisce quando PROP >= 105k (passata) o <= 90k (bruciata PROP)
+            o BROKER <= 0 (bruciato BROKER)
+
+    Returns:
+        None se tutto ok
+        dict con status e messaggio se fase finita
+    """
+    global user_id
+
+    try:
+        # Ottieni balance PROP
+        account_info_prop = mt5_prop.account_info()
+        if not account_info_prop:
+            return None
+
+        prop_balance = account_info_prop.balance
+
+        # Ottieni balance BROKER (solo per fase 4)
+        broker_balance = None
+        if fase == 4:
+            account_info_broker = mt5_broker.account_info()
+            if account_info_broker:
+                broker_balance = account_info_broker.balance
+
+        # FASE 1: +10% o -10%
+        if fase == 1:
+            if prop_balance >= 110000:
+                return {
+                    'status': 'passed',
+                    'phase': 1,
+                    'balance': prop_balance,
+                    'message': f'Congratulazioni! Hai superato la Fase 1 con un balance di ${prop_balance:,.2f}. '
+                               f'Ora puoi passare alla Fase 2. Aggiorna le credenziali nel sito e riavvia il trading.'
+                }
+            elif prop_balance <= 90000:
+                return {
+                    'status': 'failed',
+                    'phase': 1,
+                    'balance': prop_balance,
+                    'message': f'La Fase 1 è fallita. Il conto PROP è stato bruciato con balance ${prop_balance:,.2f}. '
+                               f'Ricarica il conto e riprova.'
+                }
+
+        # FASE 2: +5% o -10%
+        elif fase == 2:
+            if prop_balance >= 105000:
+                return {
+                    'status': 'passed',
+                    'phase': 2,
+                    'balance': prop_balance,
+                    'message': f'Congratulazioni! Hai superato la Fase 2 con un balance di ${prop_balance:,.2f}. '
+                               f'Ora puoi passare alla Fase 3. Aggiorna le credenziali nel sito e riavvia il trading.'
+                }
+            elif prop_balance <= 90000:
+                return {
+                    'status': 'failed',
+                    'phase': 2,
+                    'balance': prop_balance,
+                    'message': f'La Fase 2 è fallita. Il conto PROP è stato bruciato con balance ${prop_balance:,.2f}. '
+                               f'Ricarica il conto e riprova.'
+                }
+
+        # FASE 3: +50$ (gestito da check_phase3_profit, qui solo per completezza)
+        elif fase == 3:
+            if prop_balance >= 100050:
+                return {
+                    'status': 'passed',
+                    'phase': 3,
+                    'balance': prop_balance,
+                    'message': f'Congratulazioni! Hai superato la Fase 3 con un balance di ${prop_balance:,.2f}. '
+                               f'Ora puoi passare alla Fase 4. Aggiorna le credenziali nel sito e riavvia il trading.'
+                }
+
+        # FASE 4: +5% PROP o -10% PROP o BROKER bruciato
+        elif fase == 4:
+            if prop_balance >= 105000:
+                return {
+                    'status': 'passed',
+                    'phase': 4,
+                    'balance': prop_balance,
+                    'message': f'Congratulazioni! Hai completato la Fase 4 (FINALE) con un balance PROP di ${prop_balance:,.2f}. '
+                               f'Hai completato con successo tutto il percorso!'
+                }
+            elif prop_balance <= 90000:
+                return {
+                    'status': 'failed',
+                    'phase': 4,
+                    'balance': prop_balance,
+                    'message': f'La Fase 4 è fallita. Il conto PROP è stato bruciato con balance ${prop_balance:,.2f}. '
+                               f'Ricarica il conto e riprova.'
+                }
+            elif broker_balance is not None and broker_balance <= 0:
+                return {
+                    'status': 'failed',
+                    'phase': 4,
+                    'balance': broker_balance,
+                    'message': f'La Fase 4 è fallita. Il conto BROKER è stato bruciato con balance ${broker_balance:,.2f}. '
+                               f'Ricarica il conto broker e riprova.'
+                }
+
+        return None  # Fase ancora in corso
+
+    except Exception as e:
+        print(f"✗ Errore monitoraggio fase: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+
+def handle_phase_end(phase_result, netwatcher):
+    """
+    Gestisce la fine di una fase: chiude posizioni, ferma trading, invia email.
+
+    Args:
+        phase_result: dict con status, phase, balance, message
+        netwatcher: istanza NetWatcher per controllare connessione
+    """
+    global user_id, is_running
+
+    try:
+        print("\n" + "=" * 80)
+        print(f"🚨 FINE FASE {phase_result['phase']} - {phase_result['status'].upper()}")
+        print("=" * 80)
+        print(phase_result['message'])
+        print("=" * 80)
+
+        # Chiudi tutte le posizioni
+        print("\n→ Chiusura di tutte le posizioni...")
+        close_all_positions(mt5_prop, "PROP")
+        close_all_positions(mt5_broker, "BROKER")
+        print("✓ Posizioni chiuse")
+
+        # Ferma il trading
+        print(f"\n→ Fermando il trading per user {user_id}...")
+        config.stop_trading(user_id, netwatcher)
+        is_running = False
+
+        # Invia email di notifica
+        subject = f"Fase {phase_result['phase']} - {phase_result['status'].upper()}"
+        config.send_email_to_user(user_id, subject, phase_result['message'], netwatcher)
+
+        print("\n✓ Notifica inviata all'utente")
+        print("=" * 80)
+
+    except Exception as e:
+        print(f"✗ Errore gestione fine fase: {e}")
         import traceback
         traceback.print_exc()
 
@@ -814,7 +1398,7 @@ def open_orders_for_signal(order, params, creds):
         print(f"  BROKER ticket: {broker_ticket}")
 
 
-def listen_for_orders(creds, login_timestamp):
+def listen_for_orders(creds, login_timestamp, netwatcher):
     """
     Loop principale: ascolta nuovi ordini e li copia
     """
@@ -830,25 +1414,36 @@ def listen_for_orders(creds, login_timestamp):
 
     last_check = login_timestamp
     params = get_trade_params(creds['prop']['fase'], creds['prop']['size'])
+    fase = creds['prop']['fase']
 
-    # Contatore per logging periodico
+    # Contatore per logging periodico e controllo fasi
     loop_count = 0
+    phase_check_interval = 100  # Controlla ogni 10 secondi (100 * 0.1s)
 
     while is_running:
         try:
             loop_count += 1
 
+            # BLOCCO COMPLETO se autotrading è disabilitato
+            if not autotrading_ok:
+                # Log periodico ogni 50 iterazioni (~5 secondi) anche quando bloccato
+                if loop_count % 50 == 0:
+                    print(f"[{datetime.now().strftime('%H:%M:%S')}] ⚠ Trading BLOCCATO: AutoTrading disabilitato su MT5. In attesa riabilitazione...")
+                time.sleep(0.1)
+                continue
+
             # Log periodico ogni 50 iterazioni (~5 secondi)
             if loop_count % 50 == 0:
                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Loop attivo, in ascolto...")
 
-            # Controlla se started_trading è ancora TRUE
-            if not config.check_started_trading(user_id):
+            # Controlla se started_trading è ancora TRUE (solo se online)
+            started = config.check_started_trading(user_id, netwatcher)
+            if started is False:  # None = errore rete (ignora), False = disabilitato
                 print("\n⚠ Trading disabilitato dall'utente. Stop.")
                 break
 
-            # Recupera nuovi ordini
-            new_orders = config.poll_new_orders(last_check)
+            # Recupera nuovi ordini (solo se online)
+            new_orders = config.poll_new_orders(last_check, netwatcher)
 
             if new_orders:
                 print(f"\n✓ Ricevuti {len(new_orders)} nuovi ordini")
@@ -858,9 +1453,27 @@ def listen_for_orders(creds, login_timestamp):
                 # Aggiorna timestamp
                 last_check = order['ts']
 
-            # Controlla fase 3 (chiusura a 50$ profit)
-            if params.get('target_profit'):
-                check_phase3_profit()
+            # Controlla condizioni fine fase ogni 10 secondi
+            if loop_count % phase_check_interval == 0:
+                # Per fase 3, usa la funzione dedicata
+                if fase == 3:
+                    phase3_ended = check_phase3_profit()
+                    if phase3_ended:
+                        phase_result = {
+                            'status': 'passed',
+                            'phase': 3,
+                            'balance': 100050,
+                            'message': 'Congratulazioni! Hai superato la Fase 3 raggiungendo il target di +$50. '
+                                       'Ora puoi passare alla Fase 4. Aggiorna le credenziali nel sito e riavvia il trading.'
+                        }
+                        handle_phase_end(phase_result, netwatcher)
+                        break
+                else:
+                    # Per altre fasi, usa monitor_phase_conditions
+                    phase_result = monitor_phase_conditions(fase)
+                    if phase_result:
+                        handle_phase_end(phase_result, netwatcher)
+                        break
 
         except KeyboardInterrupt:
             print("\n⚠ Interruzione richiesta (Ctrl+C)")
@@ -884,21 +1497,29 @@ def main():
     print(" " * 20 + "MT5 SLAVE COPYTRADER")
     print("=" * 80)
 
+    # Inizializza watcher rete
+    netwatcher = NetWatcher()
+    netwatcher.start()
+    print("✓ NetWatcher avviato (monitoraggio connessione internet)")
+
+    # Variabile per thread autotrading (verrà creato dopo login)
+    autotrading_watcher = None
+
     try:
         # Step 0: Setup VPS con istanze (solo una volta)
         main_setup()
 
         # Step 1: Identifica VPS e utente (solo una volta)
-        print("\n[Step 1/6] Identificazione VPS e utente...")
+        print("\n[Step 1/7] Identificazione VPS e utente...")
         vps_ip = config.get_vps_ip()
-        user = config.get_user_by_vps_ip(vps_ip)
+        user = config.get_user_by_vps_ip(vps_ip, netwatcher)
 
         # Step 2: Se nessun utente, attendi assegnazione (solo una volta)
         if not user:
-            print("\n[Step 2/6] Attesa assegnazione VPS...")
-            user = config.wait_for_vps_assignment()
+            print("\n[Step 2/7] Attesa assegnazione VPS...")
+            user = config.wait_for_vps_assignment(netwatcher=netwatcher)
         else:
-            print("\n[Step 2/6] VPS già assegnata, skip attesa")
+            print("\n[Step 2/7] VPS già assegnata, skip attesa")
 
         user_id = user['id']
         print(f"✓ User ID: {user_id}")
@@ -907,38 +1528,73 @@ def main():
         while True:
             try:
                 # Step 3: Attendi started_trading = TRUE
-                print("\n[Step 3/6] Attesa avvio trading dall'utente...")
-                current_creds = config.wait_for_trading_start(user_id)
+                print("\n[Step 3/7] Attesa avvio trading dall'utente...")
+                current_creds = config.wait_for_trading_start(user_id, netwatcher=netwatcher)
                 print("✓ Credenziali caricate")
 
                 # Reset flag per il nuovo ciclo
                 is_running = True
 
                 # Step 4: Login su entrambi i conti
-                print("\n[Step 4/6] Login su conti MT5...")
-                login_accounts(current_creds)
+                print("\n[Step 4/7] Login su conti MT5...")
+                login_result = login_accounts(current_creds)
+
+                # Se credenziali errate, invia email e riprova
+                if login_result == False:
+                    print("\n" + "=" * 80)
+                    print("⚠ CREDENZIALI ERRATE")
+                    print("=" * 80)
+                    print("Le credenziali PROP e/o BROKER non sono corrette.")
+                    print("Invio notifica email all'utente...")
+
+                    # Ferma il trading
+                    config.stop_trading(user_id, netwatcher)
+
+                    # Invia email di notifica
+                    subject = "Errore: Credenziali MT5 non corrette"
+                    message = ("Le credenziali inserite per il conto PROP e/o BROKER non sono corrette. "
+                               "Per favore verifica i dati inseriti nel sito e riprova. "
+                               "Il trading è stato automaticamente fermato.")
+                    config.send_email_to_user(user_id, subject, message, netwatcher)
+
+                    print("✓ Notifica inviata")
+                    print("\nIn attesa che l'utente inserisca credenziali corrette...")
+                    print("=" * 80)
+
+                    # Torna all'inizio del loop per aspettare nuove credenziali
+                    continue
+
                 login_timestamp = datetime.now(timezone.utc).isoformat()
                 print(f"✓ Login completato - Timestamp: {login_timestamp}")
 
-                # Step 5: Avvia thread di monitoraggio sincronizzazione
-                print("\n[Step 5/6] Avvio thread sincronizzazione posizioni...")
+                # Step 5: Avvia thread monitoraggio autotrading
+                print("\n[Step 5/7] Avvio thread monitoraggio AutoTrading...")
+                autotrading_watcher = AutoTradingWatcher(vps_ip)
+                autotrading_watcher.start()
+                time.sleep(1)  # Attendi avvio thread
+                print("✓ Thread AutoTrading avviato (controllo ogni 10s)")
+
+                # Step 6: Avvia thread di monitoraggio sincronizzazione
+                print("\n[Step 6/7] Avvio thread sincronizzazione posizioni...")
                 sync_thread = threading.Thread(target=monitor_positions_sync, daemon=True)
                 sync_thread.start()
                 time.sleep(1)  # Attendi avvio thread
                 print("✓ Thread sincronizzazione avviato")
 
-                # Step 6: Ascolta e copia ordini
-                print("\n[Step 6/6] Avvio ascolto ordini...")
-                listen_for_orders(current_creds, login_timestamp)
+                # Step 7: Ascolta e copia ordini
+                print("\n[Step 7/7] Avvio ascolto ordini...")
+                listen_for_orders(current_creds, login_timestamp, netwatcher)
 
                 # Se arriviamo qui, l'utente ha fermato il trading
                 print("\n" + "=" * 80)
                 print("TRADING FERMATO DALL'UTENTE")
                 print("=" * 80)
 
-                # Ferma il thread di sincronizzazione
+                # Ferma i thread
                 is_running = False
-                time.sleep(1)  # Attendi che il thread si fermi
+                if autotrading_watcher:
+                    autotrading_watcher.stop()
+                time.sleep(1)  # Attendi che i thread si fermino
 
                 # Chiudi tutte le posizioni aperte
                 print("\n→ Chiusura di tutte le posizioni aperte...")
@@ -972,6 +1628,8 @@ def main():
 
                 # In caso di errore, chiudi tutto e riprova
                 is_running = False
+                if autotrading_watcher:
+                    autotrading_watcher.stop()
                 try:
                     close_all_positions(mt5_prop, "PROP")
                     close_all_positions(mt5_broker, "BROKER")
@@ -993,6 +1651,11 @@ def main():
 
     finally:
         is_running = False
+        # Ferma i thread
+        if autotrading_watcher:
+            autotrading_watcher.stop()
+        netwatcher.stop()
+
         print("\n" + "=" * 80)
         print("Chiusura finale conti MT5...")
         try:

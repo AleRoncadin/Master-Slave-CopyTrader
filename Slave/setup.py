@@ -211,8 +211,6 @@ def enable_autotrading(mt5_path):
         # Scrivi il file
         with open(config_file_install, 'w', encoding='utf-8') as f:
             f.writelines(config_content)
-
-        print(f"✓ AutoTrading abilitato in: {config_file_install}")
         enabled_count += 1
 
     except Exception as e:
@@ -258,7 +256,6 @@ def enable_autotrading(mt5_path):
                             with open(config_file_appdata, 'w', encoding='utf-8') as f:
                                 f.writelines(config_content)
 
-                            print(f"✓ AutoTrading abilitato in AppData: {folder[:8]}...")
                             enabled_count += 1
 
                         except Exception as e:
@@ -267,9 +264,7 @@ def enable_autotrading(mt5_path):
     except Exception as e:
         print(f"⚠ Errore config AppData: {e}")
 
-    if enabled_count > 0:
-        print(f"\n✓ AutoTrading abilitato in {enabled_count} location")
-    else:
+    if enabled_count <= 0:
         print(f"\n⚠ ATTENZIONE: Non è stato possibile abilitare AutoTrading automaticamente")
         print("   Dovrai abilitarlo manualmente in MT5: Tools -> Options -> Expert Advisors -> Allow Algo Trading")
 
@@ -297,10 +292,6 @@ def enable_autotrading_only():
     """
     Abilita solo AutoTrading senza reinstallare
     """
-    print("=" * 60)
-    print("ABILITA ALGOTRADING SU ISTANZE ESISTENTI")
-    print("=" * 60)
-    print()
 
     status = check_mt5_instances()
 
@@ -308,18 +299,11 @@ def enable_autotrading_only():
         print("✗ Nessuna istanza MT5 trovata. Esegui prima l'installazione completa.")
         return
 
-    print("Abilitazione AutoTrading...")
     if status['prop']:
-        print("\n→ PROP:")
         enable_autotrading(PATHS['prop'])
 
     if status['broker']:
-        print("\n→ BROKER:")
         enable_autotrading(PATHS['broker'])
-
-    print("\n" + "=" * 60)
-    print("✓ OPERAZIONE COMPLETATA")
-    print("=" * 60)
 
 
 def main_setup():
@@ -355,7 +339,6 @@ def main_setup():
         create_mt5_instances()
         
         # Abilita AutoTrading
-        print("\nAbilitazione AutoTrading...")
         for name in ['prop', 'broker']:
             enable_autotrading(PATHS[name])
         
